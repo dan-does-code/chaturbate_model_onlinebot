@@ -103,34 +103,13 @@ Deno.cron("Check Model Statuses", "*/1 * * * *", async () => {
   }
 })
 
-// --- HTTP SERVER ---
-const handleUpdate = webhookCallback(bot, "std/http")
+// --- START THE BOT WITH LONG POLLING ---
+// This command tells the bot to actively fetch updates from Telegram
+// instead of waiting for a web server. This bypasses all webhook issues.
+bot.start()
 
-Deno.serve(async (req) => {
-  try {
-    const url = new URL(req.url)
-    console.log(`📥 Received request: ${url.pathname}`)
-
-    // Handle webhook updates
-    if (url.pathname === `/${BOT_TOKEN}` || url.pathname === `/webhook/${BOT_TOKEN}`) {
-      console.log("🔄 Processing webhook update...")
-      return await handleUpdate(req)
-    }
-
-    // Health check endpoint
-    if (url.pathname === "/health") {
-      return new Response("OK", { status: 200 })
-    }
-
-    console.log("❌ Unknown path:", url.pathname)
-    return new Response("Not Found", { status: 404 })
-  } catch (err) {
-    console.error("Server error:", err)
-    return new Response("Internal Server Error", { status: 500 })
-  }
-})
-
-console.log("🚀 Bot deployed and running!")
+// We update the console log to reflect the new running mode.
+console.log("🚀 Bot started with Long Polling!")
 console.log("📊 All features active:")
 console.log("  ✅ Model status monitoring")
 console.log("  ✅ User subscriptions")
@@ -138,4 +117,3 @@ console.log("  ✅ Interactive button interface")
 console.log("  ✅ Deep linking & sharing")
 console.log("  ✅ Admin panel & broadcasting")
 console.log("  ✅ Session duration tracking")
-console.log(`🔗 Webhook URL: https://your-domain.deno.dev/${BOT_TOKEN}`)

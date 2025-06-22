@@ -1,4 +1,4 @@
-// bot_logic.ts
+// bot-logic.ts
 //
 // This module contains all the logic for handling user commands from Telegram.
 // It uses the database module to manage subscriptions and keeps the main
@@ -10,6 +10,10 @@ import { escapeHTML, sanitizeModelName, parseAdminIds } from "./utils.ts"
 
 const BOT_USERNAME = Deno.env.get("BOT_USERNAME") || "your_bot"
 const ADMIN_IDS = parseAdminIds(Deno.env.get("ADMIN_IDS"))
+
+console.log(`🔧 Bot configuration:`)
+console.log(`   Username: ${BOT_USERNAME}`)
+console.log(`   Admin IDs: ${ADMIN_IDS.join(", ") || "None"}`)
 
 // Create main keyboard for regular users
 const mainKeyboard = new Keyboard().text("➕ Add Model").text("➖ Remove Model").row().text("📋 My List").resized()
@@ -34,59 +38,93 @@ function isAdmin(userId: number): boolean {
 }
 
 export function registerMessageHandlers(bot: Bot) {
+  console.log("🔧 Registering message handlers...")
+
   // Handle /start command with deep linking
   bot.command("start", async (ctx) => {
-    await db.addUser(ctx.from.id)
+    console.log(`📥 /start command from user ${ctx.from.id}`)
 
-    const payload = ctx.match
-    if (payload) {
-      // Deep link subscription
-      const modelName = sanitizeModelName(payload)
-      if (modelName) {
-        await db.addUserSubscription(ctx.from.id, modelName)
-        await ctx.reply(
-          `✅ Welcome! You've been automatically subscribed to <code>${escapeHTML(modelName)}</code>.\n\nYou'll receive notifications when they come online!`,
-          {
-            parse_mode: "HTML",
-            reply_markup: isAdmin(ctx.from.id) ? adminKeyboard : mainKeyboard,
-          },
-        )
-        return
+    try {
+      await db.addUser(ctx.from.id)
+      console.log(`✅ User ${ctx.from.id} added to database`)
+
+      const payload = ctx.match
+      if (payload) {
+        console.log(`🔗 Deep link payload: ${payload}`)
+        // Deep link subscription
+        const modelName = sanitizeModelName(payload)
+        if (modelName) {
+          await db.addUserSubscription(ctx.from.id, modelName)
+          await ctx.reply(
+            `✅ Welcome! You've been automatically subscribed to <code>${escapeHTML(modelName)}</code>.\n\nYou'll receive notifications when they come online!`,
+            {
+              parse_mode: "HTML",
+              reply_markup: isAdmin(ctx.from.id) ? adminKeyboard : mainKeyboard,
+            },
+          )
+          console.log(`✅ Auto-subscribed user ${ctx.from.id} to ${modelName}`)
+          return
+        }
       }
-    }
 
-    // Regular start message
-    await ctx.reply(
-      [
-        "🎭 Welcome to the Chaturbate Status Bot!",
-        "",
-        "I'll notify you when your favorite models come online.",
-        "",
-        "Use the buttons below to manage your subscriptions:",
-      ].join("\n"),
-      {
-        reply_markup: isAdmin(ctx.from.id) ? adminKeyboard : mainKeyboard,
-      },
-    )
+      // Regular start message
+      await ctx.reply(
+        [
+          "🎭 Welcome to the Chaturbate Status Bot!",
+          "",
+          "I'll notify you when your favorite models come online.",
+          "",
+          "Use the buttons below to manage your subscriptions:",
+        ].join("\n"),
+        {
+          reply_markup: isAdmin(ctx.from.id) ? adminKeyboard : mainKeyboard,
+        },
+      )
+      console.log(`✅ Sent welcome message to user ${ctx.from.id}`)
+    } catch (error) {
+      console.error(`❌ Error in /start handler:`, error)
+      await ctx.reply("❌ An error occurred. Please try again.")
+    }
   })
 
   // Handle /admin command
   bot.command("admin", async (ctx) => {
+    console.log(`📥 /admin command from user ${ctx.from.id}`)
+
     if (!isAdmin(ctx.from.id)) {
+      console.log(`❌ User ${ctx.from.id} is not an admin`)
       return // Silently ignore for non-admins
     }
 
     await ctx.reply("👑 Admin Panel\n\nChoose an action:", { reply_markup: adminPanelKeyboard })
+    console.log(`✅ Sent admin panel to user ${ctx.from.id}`)
+  })
+
+  // Add a test command for debugging
+  bot.command("test", async (ctx) => {
+    console.log(`📥 /test command from user ${ctx.from.id}`)
+    await ctx.reply("🧪 Test successful! Bot is responding to commands.")
   })
 
   // Handle button presses
   bot.on("message:text", async (ctx) => {
     const text = ctx.message.text
     const userId = ctx.from.id
+
+    console.log(`📥 Text message from user ${userId}: "${text}"`)
+
+    // Skip if it's a command (already handled above)
+    if (text.startsWith("/")) {
+      console.log(`⏭️ Skipping command: ${text}`)
+      return
+    }
+
     const userState = userStates.get(userId)
 
     // Handle user states (conversations)
     if (userState) {
+      console.log(`🔄 User ${userId} in state: ${userState.action}`)
+
       switch (userState.action) {
         case "waiting_for_model_to_add":
           const modelToAdd = sanitizeModelName(text)
@@ -100,6 +138,7 @@ export function registerMessageHandlers(bot: Bot) {
             parse_mode: "HTML",
           })
           userStates.delete(userId)
+          console.log(`✅ User ${userId} subscribed to ${modelToAdd}`)
           break
 
         case "waiting_for_model_to_remove":
@@ -112,6 +151,7 @@ export function registerMessageHandlers(bot: Bot) {
           await db.removeUserSubscription(userId, modelToRemove)
           await ctx.reply(`🗑️ Unsubscribed from <code>${escapeHTML(modelToRemove)}</code>.`, { parse_mode: "HTML" })
           userStates.delete(userId)
+          console.log(`✅ User ${userId} unsubscribed from ${modelToRemove}`)
           break
 
         case "waiting_for_broadcast_message":
@@ -137,61 +177,81 @@ export function registerMessageHandlers(bot: Bot) {
     }
 
     // Handle button text
-    switch (text) {
-      case "➕ Add Model":
-        userStates.set(userId, { action: "waiting_for_model_to_add" })
-        await ctx.reply("Please send me the username of the model you want to track:")
-        break
+    console.log(`🔘 Processing button: "${text}"`)
 
-      case "➖ Remove Model":
-        userStates.set(userId, { action: "waiting_for_model_to_remove" })
-        await ctx.reply("Please send me the username of the model you want to stop tracking:")
-        break
+    try {
+      switch (text) {
+        case "➕ Add Model":
+          console.log(`➕ Add Model button pressed by user ${userId}`)
+          userStates.set(userId, { action: "waiting_for_model_to_add" })
+          await ctx.reply("Please send me the username of the model you want to track:")
+          break
 
-      case "📋 My List":
-        const subs = await db.getUserSubscriptions(userId)
-        if (subs.length === 0) {
-          await ctx.reply("You are not subscribed to any models yet.\n\nUse ➕ Add Model to get started!")
-          return
-        }
+        case "➖ Remove Model":
+          console.log(`➖ Remove Model button pressed by user ${userId}`)
+          userStates.set(userId, { action: "waiting_for_model_to_remove" })
+          await ctx.reply("Please send me the username of the model you want to stop tracking:")
+          break
 
-        let listText = "<b>Your subscriptions:</b>\n\n"
-        const keyboard = new InlineKeyboard()
+        case "📋 My List":
+          console.log(`📋 My List button pressed by user ${userId}`)
+          const subs = await db.getUserSubscriptions(userId)
+          console.log(`📋 User ${userId} has ${subs.length} subscriptions`)
 
-        for (const model of subs) {
-          listText += `• <code>${escapeHTML(model)}</code>\n`
-          keyboard.text(`Share ${model}`, `share_${model}`).row()
-        }
+          if (subs.length === 0) {
+            await ctx.reply("You are not subscribed to any models yet.\n\nUse ➕ Add Model to get started!")
+            return
+          }
 
-        await ctx.reply(listText, {
-          parse_mode: "HTML",
-          reply_markup: keyboard,
-        })
-        break
+          let listText = "<b>Your subscriptions:</b>\n\n"
+          const keyboard = new InlineKeyboard()
 
-      case "👑 Admin Panel":
-        if (!isAdmin(userId)) return
-        await ctx.reply("👑 Admin Panel\n\nChoose an action:", { reply_markup: adminPanelKeyboard })
-        break
+          for (const model of subs) {
+            listText += `• <code>${escapeHTML(model)}</code>\n`
+            keyboard.text(`Share ${model}`, `share_${model}`).row()
+          }
 
-      case "📢 Broadcast":
-        if (!isAdmin(userId)) return
-        userStates.set(userId, { action: "waiting_for_broadcast_message" })
-        await ctx.reply(
-          "📢 Broadcast Message\n\nSend me the message you want to broadcast to all users.\n\nYou can include text, photos, and formatting.",
-        )
-        break
+          await ctx.reply(listText, {
+            parse_mode: "HTML",
+            reply_markup: keyboard,
+          })
+          break
 
-      case "📊 Stats":
-        if (!isAdmin(userId)) return
-        const totalUsers = (await db.getAllUserIds()).length
-        const totalModels = (await db.getModelQueue()).length
-        await ctx.reply(`📊 Bot Statistics\n\n👥 Total Users: ${totalUsers}\n🎭 Tracked Models: ${totalModels}`)
-        break
+        case "👑 Admin Panel":
+          if (!isAdmin(userId)) {
+            console.log(`❌ Non-admin ${userId} tried to access admin panel`)
+            return
+          }
+          await ctx.reply("👑 Admin Panel\n\nChoose an action:", { reply_markup: adminPanelKeyboard })
+          break
 
-      case "🔙 Back to Main":
-        await ctx.reply("🎭 Main Menu", { reply_markup: isAdmin(userId) ? adminKeyboard : mainKeyboard })
-        break
+        case "📢 Broadcast":
+          if (!isAdmin(userId)) return
+          userStates.set(userId, { action: "waiting_for_broadcast_message" })
+          await ctx.reply(
+            "📢 Broadcast Message\n\nSend me the message you want to broadcast to all users.\n\nYou can include text, photos, and formatting.",
+          )
+          break
+
+        case "📊 Stats":
+          if (!isAdmin(userId)) return
+          const totalUsers = (await db.getAllUserIds()).length
+          const totalModels = (await db.getModelQueue()).length
+          await ctx.reply(`📊 Bot Statistics\n\n👥 Total Users: ${totalUsers}\n🎭 Tracked Models: ${totalModels}`)
+          break
+
+        case "🔙 Back to Main":
+          await ctx.reply("🎭 Main Menu", { reply_markup: isAdmin(userId) ? adminKeyboard : mainKeyboard })
+          break
+
+        default:
+          console.log(`❓ Unknown button text: "${text}"`)
+          // Don't respond to unknown text to avoid spam
+          break
+      }
+    } catch (error) {
+      console.error(`❌ Error handling button "${text}":`, error)
+      await ctx.reply("❌ An error occurred. Please try again.")
     }
   })
 
@@ -200,51 +260,59 @@ export function registerMessageHandlers(bot: Bot) {
     const data = ctx.callbackQuery.data
     const userId = ctx.from.id
 
-    if (data.startsWith("share_")) {
-      const modelName = data.replace("share_", "")
-      const shareLink = `https://t.me/${BOT_USERNAME}?start=${modelName}`
-      await ctx.answerCallbackQuery()
-      await ctx.reply(
-        `🔗 Share link for <code>${escapeHTML(modelName)}</code>:\n\n<code>${shareLink}</code>\n\nAnyone who clicks this link will be automatically subscribed to ${escapeHTML(modelName)}!`,
-        { parse_mode: "HTML" },
-      )
-    } else if (data === "confirm_broadcast") {
-      if (!isAdmin(userId)) {
-        await ctx.answerCallbackQuery("❌ Access denied")
-        return
-      }
+    console.log(`📥 Callback query from user ${userId}: ${data}`)
 
-      const userState = userStates.get(userId)
-      if (userState?.action === "confirming_broadcast" && userState.data) {
-        await ctx.answerCallbackQuery("✅ Broadcasting...")
-        await ctx.editMessageText("📢 Broadcasting message to all users...")
-
-        // Trigger broadcast (this will be handled in main.ts)
-        const allUsers = await db.getAllUserIds()
-        let successCount = 0
-
-        for (const chatId of allUsers) {
-          try {
-            await ctx.api.copyMessage(chatId, userState.data.chat.id, userState.data.message_id)
-            successCount++
-            await new Promise((resolve) => setTimeout(resolve, 100)) // Rate limiting
-          } catch (error) {
-            console.error(`Failed to send to ${chatId}:`, error)
-          }
+    try {
+      if (data.startsWith("share_")) {
+        const modelName = data.replace("share_", "")
+        const shareLink = `https://t.me/${BOT_USERNAME}?start=${modelName}`
+        await ctx.answerCallbackQuery()
+        await ctx.reply(
+          `🔗 Share link for <code>${escapeHTML(modelName)}</code>:\n\n<code>${shareLink}</code>\n\nAnyone who clicks this link will be automatically subscribed to ${escapeHTML(modelName)}!`,
+          { parse_mode: "HTML" },
+        )
+      } else if (data === "confirm_broadcast") {
+        if (!isAdmin(userId)) {
+          await ctx.answerCallbackQuery("❌ Access denied")
+          return
         }
 
-        await ctx.editMessageText(`✅ Broadcast completed!\n\nSent to ${successCount}/${allUsers.length} users.`)
+        const userState = userStates.get(userId)
+        if (userState?.action === "confirming_broadcast" && userState.data) {
+          await ctx.answerCallbackQuery("✅ Broadcasting...")
+          await ctx.editMessageText("📢 Broadcasting message to all users...")
+
+          const allUsers = await db.getAllUserIds()
+          let successCount = 0
+
+          for (const chatId of allUsers) {
+            try {
+              await ctx.api.copyMessage(chatId, userState.data.chat.id, userState.data.message_id)
+              successCount++
+              await new Promise((resolve) => setTimeout(resolve, 100)) // Rate limiting
+            } catch (error) {
+              console.error(`Failed to send to ${chatId}:`, error)
+            }
+          }
+
+          await ctx.editMessageText(`✅ Broadcast completed!\n\nSent to ${successCount}/${allUsers.length} users.`)
+          userStates.delete(userId)
+        }
+      } else if (data === "cancel_broadcast") {
+        if (!isAdmin(userId)) {
+          await ctx.answerCallbackQuery("❌ Access denied")
+          return
+        }
+
+        await ctx.answerCallbackQuery("❌ Cancelled")
+        await ctx.editMessageText("❌ Broadcast cancelled.")
         userStates.delete(userId)
       }
-    } else if (data === "cancel_broadcast") {
-      if (!isAdmin(userId)) {
-        await ctx.answerCallbackQuery("❌ Access denied")
-        return
-      }
-
-      await ctx.answerCallbackQuery("❌ Cancelled")
-      await ctx.editMessageText("❌ Broadcast cancelled.")
-      userStates.delete(userId)
+    } catch (error) {
+      console.error(`❌ Error handling callback query:`, error)
+      await ctx.answerCallbackQuery("❌ An error occurred")
     }
   })
+
+  console.log("✅ Message handlers registered successfully")
 }

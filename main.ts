@@ -51,38 +51,69 @@ Deno.cron("Check Model Statuses", "*/1 * * * *", async () => {
       return
     }
 
-    for (const model of queue) {
-      try {
-        const currentStatus = await fetchModelStatus(model)
-        if (currentStatus === "unknown") {
-          console.warn(`⚠️ Unknown status for ${model}, skipping...`)
-          await sleep(500)
-          continue
-        }
+    // Process models in smaller batches to reduce memory usage
+    const BATCH_SIZE = 10
+    const totalBatches = Math.ceil(queue.length / BATCH_SIZE)
+    
+    for (let batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
+      const batchStart = batchIndex * BATCH_SIZE
+      const batchEnd = Math.min(batchStart + BATCH_SIZE, queue.length)
+      const batch = queue.slice(batchStart, batchEnd)
+      
+      console.log(`📦 Processing batch ${batchIndex + 1}/${totalBatches} (${batch.length} models)`)
+      
+      // Process batch with some parallelization (but not too much to avoid rate limits)
+      const batchPromises = batch.map(async (model, index) => {
+        try {
+          // Stagger requests to avoid overwhelming the API
+          await sleep(index * 100)
+          
+          const currentStatus = await fetchModelStatus(model)
+          if (currentStatus === "unknown") {
+            console.warn(`⚠️ Unknown status for ${model}, skipping...`)
+            return
+          }
 
-        const storedStatus = await db.getStoredModelStatus(model)
-        const prevStatus = storedStatus?.status ?? "offline"
+          const storedStatus = await db.getStoredModelStatus(model)
+          const prevStatus = storedStatus?.status ?? "offline"
 
-        if (currentStatus !== prevStatus) {
-          await processStatusChange(model, currentStatus, prevStatus, storedStatus)
+          if (currentStatus !== prevStatus) {
+            await processStatusChange(model, currentStatus, prevStatus, storedStatus)
+          }
+          
+          processedCount++
+          
+        } catch (error) {
+          errorCount++
+          console.error(`❌ Error processing ${model}:`, error)
         }
-        
-        processedCount++
-        await sleep(500) // Rate limiting
-        
-      } catch (error) {
-        errorCount++
-        console.error(`❌ Error processing ${model}:`, error)
-        
-        // Continue processing other models even if one fails
-        if (errorCount > 5) {
-          console.error("🚨 Too many errors, stopping cron job")
-          break
-        }
+      })
+      
+      await Promise.all(batchPromises)
+      
+      // Break if too many errors
+      if (errorCount > 5) {
+        console.error("🚨 Too many errors, stopping cron job")
+        break
+      }
+      
+      // Short pause between batches
+      if (batchIndex < totalBatches - 1) {
+        await sleep(1000)
       }
     }
     
+    const executionTime = Date.now() - startTime
+    const cacheStats = db.getCacheStats()
+    
     console.log(`✅ Cron job completed: ${processedCount} models processed, ${errorCount} errors`)
+    console.log(`⏱️ Execution time: ${executionTime}ms`)
+    console.log(`💾 Cache: ${cacheStats.size} items`)
+    
+    // Log warning if execution took too long
+    if (executionTime > 45000) { // 45 seconds
+      console.warn(`⚠️ Cron job execution took ${executionTime}ms - consider optimizing`)
+    }
     
   } catch (error) {
     console.error("🚨 Critical error in cron job:", error)
@@ -96,7 +127,7 @@ Deno.cron("Check Model Statuses", "*/1 * * * *", async () => {
   }
 })
 
-// Helper function to process status changes
+// Helper function to process status changes with debouncing
 async function processStatusChange(
   model: string, 
   currentStatus: string, 
@@ -108,46 +139,101 @@ async function processStatusChange(
   const subscribers = await db.getModelSubscribers(model)
   const safeModelName = escapeHTML(model)
   const modelLink = `https://chaturbate.com/${model}/`
-
-  let message: string
-  let newStatusData: db.ModelStatus
+  const now = Date.now()
 
   if (currentStatus === "online") {
-    // Model came online
-    newStatusData = {
-      status: "online",
-      online_since: Date.now(),
+    // Model came online - use debounce logic
+    if (prevStatus === "offline") {
+      // First time online - start grace period
+      const newStatusData: db.ModelStatus = {
+        status: "online",
+        online_since: now,
+        notified_users: [],
+        last_notification_time: null
+      }
+      await db.updateModelStatus(model, newStatusData)
+      console.log(`⏰ ${model} online - starting 2-minute grace period`)
+      return
+    } else if (prevStatus === "online") {
+      // Model has been online - check if grace period has passed
+      const GRACE_PERIOD_MS = 2 * 60 * 1000 // 2 minutes
+      const timeOnline = now - (storedStatus?.online_since || now)
+      
+      if (timeOnline < GRACE_PERIOD_MS) {
+        // Still in grace period
+        return
+      }
+      
+      // Grace period passed - check if we need to notify new subscribers
+      const notifiedUsers = storedStatus?.notified_users || []
+      const newSubscribers = subscribers.filter(id => !notifiedUsers.includes(id))
+      
+      if (newSubscribers.length > 0) {
+        console.log(`📢 Notifying ${newSubscribers.length} new subscribers for ${model}`)
+        
+        const message = `✅ <a href="${modelLink}">${safeModelName}</a> is now <b>ONLINE</b>! 🎭`
+        await sendNotifications(newSubscribers, message, model, "online")
+        
+        // Update notification tracking
+        const updatedStatus: db.ModelStatus = {
+          ...storedStatus,
+          notified_users: subscribers, // Mark all current subscribers as notified
+          last_notification_time: now
+        }
+        await db.updateModelStatus(model, updatedStatus)
+      }
+      return
     }
-    message = `✅ <a href="${modelLink}">${safeModelName}</a> is now <b>ONLINE</b>! 🎭`
   } else {
-    // Model went offline
-    newStatusData = {
+    // Model went offline - always notify immediately
+    const newStatusData: db.ModelStatus = {
       status: "offline",
       online_since: null,
+      notified_users: [],
+      last_notification_time: null
     }
 
     let durationText = ""
     if (storedStatus?.online_since) {
-      const duration = Date.now() - storedStatus.online_since
+      const duration = now - storedStatus.online_since
       durationText = ` (Online for ${formatDuration(duration)})`
     }
 
-    message = `❌ <a href="${modelLink}">${safeModelName}</a> is now <b>OFFLINE</b>.${durationText}`
+    const message = `❌ <a href="${modelLink}">${safeModelName}</a> is now <b>OFFLINE</b>.${durationText}`
+    
+    // Update status first
+    await db.updateModelStatus(model, newStatusData)
+    
+    // Send notifications to all subscribers
+    console.log(`📢 Notifying ${subscribers.length} subscribers about ${model} going offline`)
+    await sendNotifications(subscribers, message, model, "offline")
   }
+}
 
-  // Update status in database
-  await db.updateModelStatus(model, newStatusData)
-
-  // Send notifications to all subscribers with cleanup
-  console.log(`📢 Notifying ${subscribers.length} subscribers about ${model}`)
+// Helper function to send notifications with error handling and deduplication
+async function sendNotifications(userIds: number[], message: string, modelName: string, notificationType: "online" | "offline") {
   let notificationErrors = 0
+  let sentCount = 0
+  let skippedCount = 0
   
-  for (const chatId of subscribers) {
+  for (const chatId of userIds) {
     try {
+      // Check for recent notification to prevent spam
+      const isRecent = await db.isRecentNotification(chatId, modelName, notificationType)
+      if (isRecent) {
+        skippedCount++
+        continue
+      }
+      
       await bot.api.sendMessage(chatId, message, {
         parse_mode: "HTML",
         disable_web_page_preview: false,
       })
+      
+      // Record successful notification
+      await db.recordNotification(chatId, modelName, notificationType)
+      sentCount++
+      
     } catch (error) {
       notificationErrors++
       console.error(`Failed to notify ${chatId}:`, error)
@@ -160,10 +246,14 @@ async function processStatusChange(
       
       // Don't let notification errors stop the entire process
       if (notificationErrors > 10) {
-        console.warn(`⚠️ Too many notification errors for ${model}, stopping notifications`)
+        console.warn(`⚠️ Too many notification errors for ${modelName}, stopping notifications`)
         break
       }
     }
+  }
+  
+  if (skippedCount > 0) {
+    console.log(`📊 ${modelName}: Sent ${sentCount}, skipped ${skippedCount} (recent notifications)`)
   }
 }
 

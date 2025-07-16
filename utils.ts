@@ -67,3 +67,18 @@ export function parseAdminIds(envVar: string | undefined): number[] {
     .map((id) => Number.parseInt(id.trim()))
     .filter((id) => !isNaN(id))
 }
+
+/**
+ * Checks if a Telegram API error indicates a blocked or invalid user
+ */
+export function isUserBlocked(error: any): boolean {
+  if (!error || !error.description) return false
+  
+  const description = error.description.toLowerCase()
+  return (
+    description.includes("bot was blocked") ||
+    description.includes("user is deactivated") ||
+    description.includes("chat not found") ||
+    description.includes("forbidden")
+  )
+}

@@ -6,7 +6,7 @@
 
 import { type Bot, InlineKeyboard, Keyboard } from "https://deno.land/x/grammy@v1.24.0/mod.ts"
 import * as db from "./database.ts"
-import { escapeHTML, sanitizeModelName, parseAdminIds } from "./utils.ts"
+import { escapeHTML, sanitizeModelName, parseAdminIds, isUserBlocked } from "./utils.ts"
 
 const BOT_USERNAME = Deno.env.get("BOT_USERNAME") || "your_bot"
 const ADMIN_IDS = parseAdminIds(Deno.env.get("ADMIN_IDS"))
@@ -30,8 +30,7 @@ const adminKeyboard = new Keyboard()
 // Admin panel keyboard
 const adminPanelKeyboard = new Keyboard().text("📢 Broadcast").text("📊 Stats").row().text("🔙 Back to Main").resized()
 
-// User state management for conversations
-const userStates = new Map<number, { action: string; data?: any }>()
+// User state management moved to database for persistence
 
 function isAdmin(userId: number): boolean {
   return ADMIN_IDS.includes(userId)
@@ -119,7 +118,14 @@ export function registerMessageHandlers(bot: Bot) {
       return
     }
 
-    const userState = userStates.get(userId)
+    // Priority system: Cancel state if user clicks main buttons
+    const mainCommands = ["➕ Add Model", "➖ Remove Model", "📋 My List", "👑 Admin Panel", "🔙 Back to Main", "❌ Cancel"]
+    if (mainCommands.includes(text)) {
+      await db.clearUserState(userId)
+      console.log(`🔄 Cleared state for user ${userId} due to main command: ${text}`)
+    }
+
+    const userState = await db.getUserState(userId)
 
     // Handle user states (conversations)
     if (userState) {
@@ -130,14 +136,14 @@ export function registerMessageHandlers(bot: Bot) {
           const modelToAdd = sanitizeModelName(text)
           if (!modelToAdd) {
             await ctx.reply("❌ Invalid model name. Please try again or use the menu.")
-            userStates.delete(userId)
+            await db.clearUserState(userId)
             return
           }
           await db.addUserSubscription(userId, modelToAdd)
           await ctx.reply(`✅ Subscribed! You'll receive notifications for <code>${escapeHTML(modelToAdd)}</code>.`, {
             parse_mode: "HTML",
           })
-          userStates.delete(userId)
+          await db.clearUserState(userId)
           console.log(`✅ User ${userId} subscribed to ${modelToAdd}`)
           break
 
@@ -145,22 +151,26 @@ export function registerMessageHandlers(bot: Bot) {
           const modelToRemove = sanitizeModelName(text)
           if (!modelToRemove) {
             await ctx.reply("❌ Invalid model name. Please try again or use the menu.")
-            userStates.delete(userId)
+            await db.clearUserState(userId)
             return
           }
           await db.removeUserSubscription(userId, modelToRemove)
           await ctx.reply(`🗑️ Unsubscribed from <code>${escapeHTML(modelToRemove)}</code>.`, { parse_mode: "HTML" })
-          userStates.delete(userId)
+          await db.clearUserState(userId)
           console.log(`✅ User ${userId} unsubscribed from ${modelToRemove}`)
           break
 
         case "waiting_for_broadcast_message":
           if (!isAdmin(userId)) {
-            userStates.delete(userId)
+            await db.clearUserState(userId)
             return
           }
           // Store the message for confirmation
-          userStates.set(userId, { action: "confirming_broadcast", data: ctx.message })
+          await db.setUserState(userId, { 
+            action: "confirming_broadcast", 
+            data: ctx.message,
+            expires: Date.now() + (24 * 60 * 60 * 1000) // Will be updated by setUserState
+          })
 
           // Create confirmation keyboard
           const confirmKeyboard = new InlineKeyboard()
@@ -183,13 +193,19 @@ export function registerMessageHandlers(bot: Bot) {
       switch (text) {
         case "➕ Add Model":
           console.log(`➕ Add Model button pressed by user ${userId}`)
-          userStates.set(userId, { action: "waiting_for_model_to_add" })
+          await db.setUserState(userId, { 
+            action: "waiting_for_model_to_add",
+            expires: Date.now() + (24 * 60 * 60 * 1000) // Will be updated by setUserState
+          })
           await ctx.reply("Please send me the username of the model you want to track:")
           break
 
         case "➖ Remove Model":
           console.log(`➖ Remove Model button pressed by user ${userId}`)
-          userStates.set(userId, { action: "waiting_for_model_to_remove" })
+          await db.setUserState(userId, { 
+            action: "waiting_for_model_to_remove",
+            expires: Date.now() + (24 * 60 * 60 * 1000) // Will be updated by setUserState
+          })
           await ctx.reply("Please send me the username of the model you want to stop tracking:")
           break
 
@@ -227,7 +243,10 @@ export function registerMessageHandlers(bot: Bot) {
 
         case "📢 Broadcast":
           if (!isAdmin(userId)) return
-          userStates.set(userId, { action: "waiting_for_broadcast_message" })
+          await db.setUserState(userId, { 
+            action: "waiting_for_broadcast_message",
+            expires: Date.now() + (24 * 60 * 60 * 1000) // Will be updated by setUserState
+          })
           await ctx.reply(
             "📢 Broadcast Message\n\nSend me the message you want to broadcast to all users.\n\nYou can include text, photos, and formatting.",
           )
@@ -277,7 +296,7 @@ export function registerMessageHandlers(bot: Bot) {
           return
         }
 
-        const userState = userStates.get(userId)
+        const userState = await db.getUserState(userId)
         if (userState?.action === "confirming_broadcast" && userState.data) {
           await ctx.answerCallbackQuery("✅ Broadcasting...")
           await ctx.editMessageText("📢 Broadcasting message to all users...")
@@ -291,12 +310,18 @@ export function registerMessageHandlers(bot: Bot) {
               successCount++
               await new Promise((resolve) => setTimeout(resolve, 100)) // Rate limiting
             } catch (error) {
-              console.error(`Failed to send to ${chatId}:`, error)
+              console.error(`Failed to send broadcast to ${chatId}:`, error)
+              
+              // Clean up blocked users during broadcast
+              if (isUserBlocked(error)) {
+                console.log(`🧹 Removing blocked user ${chatId} during broadcast`)
+                await db.removeUserAndAllSubscriptions(chatId)
+              }
             }
           }
 
           await ctx.editMessageText(`✅ Broadcast completed!\n\nSent to ${successCount}/${allUsers.length} users.`)
-          userStates.delete(userId)
+          await db.clearUserState(userId)
         }
       } else if (data === "cancel_broadcast") {
         if (!isAdmin(userId)) {
@@ -306,7 +331,7 @@ export function registerMessageHandlers(bot: Bot) {
 
         await ctx.answerCallbackQuery("❌ Cancelled")
         await ctx.editMessageText("❌ Broadcast cancelled.")
-        userStates.delete(userId)
+        await db.clearUserState(userId)
       }
     } catch (error) {
       console.error(`❌ Error handling callback query:`, error)

@@ -4,7 +4,7 @@
 // It provides a clean API for the rest of the application to use
 // without needing to know the underlying key structure.
 
-import { sanitizeModelName } from "./utils.ts"
+import { sanitizeModelName, sleep } from "./utils.ts"
 
 const kv = await Deno.openKv()
 
@@ -13,45 +13,104 @@ export interface ModelStatus {
   online_since: number | null
 }
 
+export interface UserState {
+  action: string
+  data?: any
+  expires: number
+}
+
 export async function addUserSubscription(chatId: number, rawName: string): Promise<void> {
   const modelName = sanitizeModelName(rawName)
   if (!modelName) return
 
-  const op = kv
-    .atomic()
+  // First, ensure user exists
+  await kv.set(["users", chatId], true)
+
+  // Add subscription with atomic operation
+  await kv.atomic()
     .set(["subscriptions", chatId, modelName], true)
     .set(["subscribers", modelName, chatId], true)
-    .set(["users", chatId], true) // Track all users for broadcasting
+    .commit()
 
-  const queueKey = ["models_queue"]
-  const queue = (await kv.get<string[]>(queueKey)).value || []
-  if (!queue.includes(modelName)) {
-    queue.push(modelName)
-    op.set(queueKey, queue)
+  // Add to queue atomically with retry logic
+  let queueSuccess = false
+  let attempts = 0
+  const maxAttempts = 5
+
+  while (!queueSuccess && attempts < maxAttempts) {
+    const queueKey = ["models_queue"]
+    const queueResult = await kv.get<string[]>(queueKey)
+    const queue = queueResult.value || []
+    
+    if (!queue.includes(modelName)) {
+      const commitResult = await kv.atomic()
+        .check(queueResult)
+        .set(queueKey, [...queue, modelName])
+        .commit()
+      queueSuccess = commitResult.ok
+    } else {
+      queueSuccess = true // Already in queue
+    }
+    
+    attempts++
+    if (!queueSuccess && attempts < maxAttempts) {
+      await sleep(Math.random() * 100) // Random delay to reduce contention
+    }
   }
-  await op.commit()
+
+  if (!queueSuccess) {
+    console.error(`Failed to add ${modelName} to queue after ${maxAttempts} attempts`)
+  }
 }
 
 export async function removeUserSubscription(chatId: number, rawName: string): Promise<void> {
   const modelName = sanitizeModelName(rawName)
   if (!modelName) return
 
-  await kv.atomic().delete(["subscriptions", chatId, modelName]).delete(["subscribers", modelName, chatId]).commit()
+  // Remove subscription atomically
+  await kv.atomic()
+    .delete(["subscriptions", chatId, modelName])
+    .delete(["subscribers", modelName, chatId])
+    .commit()
 
-  const others = []
-  for await (const entry of kv.list({ prefix: ["subscribers", modelName] })) {
-    others.push(entry)
-    if (others.length > 0) break
+  // Check if model has other subscribers with atomic cleanup
+  let cleanupSuccess = false
+  let attempts = 0
+  const maxAttempts = 5
+
+  while (!cleanupSuccess && attempts < maxAttempts) {
+    // Check if any other subscribers exist
+    const subscribers = []
+    for await (const entry of kv.list({ prefix: ["subscribers", modelName] })) {
+      subscribers.push(entry)
+      if (subscribers.length > 0) break // Early exit if we find any
+    }
+
+    if (subscribers.length === 0) {
+      // No other subscribers, remove from queue atomically
+      const queueKey = ["models_queue"]
+      const queueResult = await kv.get<string[]>(queueKey)
+      const queue = queueResult.value || []
+      
+      const commitResult = await kv.atomic()
+        .check(queueResult)
+        .set(queueKey, queue.filter((m) => m !== modelName))
+        .delete(["statuses", modelName])
+        .commit()
+      
+      cleanupSuccess = commitResult.ok
+    } else {
+      cleanupSuccess = true // Other subscribers exist, no cleanup needed
+    }
+    
+    attempts++
+    if (!cleanupSuccess && attempts < maxAttempts) {
+      await sleep(Math.random() * 100)
+    }
   }
 
-  if (others.length === 0) {
-    const queueKey = ["models_queue"]
-    const queue = (await kv.get<string[]>(queueKey)).value || []
-    await kv.set(
-      queueKey,
-      queue.filter((m) => m !== modelName),
-    )
-    await kv.delete(["statuses", modelName])
+  if (!cleanupSuccess) {
+    console.error(`Failed to cleanup ${modelName} after ${maxAttempts} attempts`)
   }
 }
 
@@ -94,6 +153,68 @@ export async function getAllUserIds(): Promise<number[]> {
 
 export async function addUser(chatId: number): Promise<void> {
   await kv.set(["users", chatId], true)
+}
+
+// Function to remove a user and all their subscriptions (for blocked users)
+export async function removeUserAndAllSubscriptions(chatId: number): Promise<void> {
+  console.log(`🧹 Cleaning up blocked user ${chatId}`)
+  
+  // Get all user's subscriptions first
+  const userSubscriptions = await getUserSubscriptions(chatId)
+  
+  // Remove user from all model subscriber lists
+  for (const modelName of userSubscriptions) {
+    await removeUserSubscription(chatId, modelName)
+  }
+  
+  // Remove user from global users list
+  await kv.delete(["users", chatId])
+  
+  // Clean up any remaining user state
+  await clearUserState(chatId)
+  
+  console.log(`✅ Cleaned up user ${chatId} and ${userSubscriptions.length} subscriptions`)
+}
+
+// User state management functions
+export async function getUserState(chatId: number): Promise<UserState | null> {
+  const result = await kv.get<UserState>(["user_states", chatId])
+  if (result.value && result.value.expires < Date.now()) {
+    // State expired, clean it up
+    await kv.delete(["user_states", chatId])
+    return null
+  }
+  return result.value
+}
+
+export async function setUserState(chatId: number, state: UserState | null): Promise<void> {
+  const key = ["user_states", chatId]
+  if (state === null) {
+    await kv.delete(key)
+  } else {
+    // Add 24 hour expiry to prevent stale states
+    state.expires = Date.now() + (24 * 60 * 60 * 1000)
+    await kv.set(key, state)
+  }
+}
+
+export async function clearUserState(chatId: number): Promise<void> {
+  await kv.delete(["user_states", chatId])
+}
+
+// Function to clean up all expired states (can be called periodically)
+export async function cleanupExpiredStates(): Promise<number> {
+  let cleanedCount = 0
+  const now = Date.now()
+  
+  for await (const entry of kv.list<UserState>({ prefix: ["user_states"] })) {
+    if (entry.value && entry.value.expires < now) {
+      await kv.delete(entry.key)
+      cleanedCount++
+    }
+  }
+  
+  return cleanedCount
 }
 
 // Export kv for the cron lock in main.ts

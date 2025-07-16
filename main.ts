@@ -268,6 +268,10 @@ Deno.cron("Cleanup Expired States", "0 */6 * * *", async () => {
   }
 })
 
+// --- MIGRATE DATABASE ON STARTUP ---
+console.log("🔄 Running database migration on startup...")
+await db.migrateDatabase()
+
 // --- START THE BOT WITH LONG POLLING ---
 // This command tells the bot to actively fetch updates from Telegram
 // instead of waiting for a web server. This bypasses all webhook issues.

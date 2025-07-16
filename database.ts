@@ -130,7 +130,35 @@ export async function getUserSubscriptions(chatId: number): Promise<string[]> {
 
 export async function getModelSubscribers(modelName: string): Promise<number[]> {
   const result = await kv.get<number[]>(["model_subscribers", modelName])
-  return result.value || []
+  
+  // If array is empty, try to migrate from old format
+  if (!result.value || result.value.length === 0) {
+    await migrateModelSubscribers(modelName)
+    
+    // Try again after migration
+    const migratedResult = await kv.get<number[]>(["model_subscribers", modelName])
+    return migratedResult.value || []
+  }
+  
+  return result.value
+}
+
+// Migration function to populate model subscriber arrays from existing individual records
+async function migrateModelSubscribers(modelName: string): Promise<void> {
+  const subscriberIds: number[] = []
+  
+  // Scan for existing subscriber records for this model
+  for await (const entry of kv.list<boolean>({ prefix: ["subscribers", modelName] })) {
+    const userId = entry.key[2] as number
+    if (typeof userId === 'number' && !subscriberIds.includes(userId)) {
+      subscriberIds.push(userId)
+    }
+  }
+  
+  if (subscriberIds.length > 0) {
+    console.log(`📦 Migrating ${subscriberIds.length} subscribers for model ${modelName}`)
+    await kv.set(["model_subscribers", modelName], subscriberIds)
+  }
 }
 
 // Internal function to add subscriber to model's array
@@ -259,7 +287,39 @@ async function removeModelFromQueue(modelName: string): Promise<void> {
 // Store user IDs in an array for efficient broadcast operations
 export async function getAllUserIds(): Promise<number[]> {
   const result = await kv.get<number[]>(["user_ids_array"])
-  return result.value || []
+  
+  // If array is empty, try to migrate from old format
+  if (!result.value || result.value.length === 0) {
+    console.log("🔄 User array empty, checking for existing users to migrate...")
+    await migrateUsersToArray()
+    
+    // Try again after migration
+    const migratedResult = await kv.get<number[]>(["user_ids_array"])
+    return migratedResult.value || []
+  }
+  
+  return result.value
+}
+
+// Migration function to populate user array from existing individual user records
+async function migrateUsersToArray(): Promise<void> {
+  const userIds: number[] = []
+  
+  // Scan for existing user records
+  for await (const entry of kv.list<boolean>({ prefix: ["users"] })) {
+    const userId = entry.key[1] as number
+    if (typeof userId === 'number' && !userIds.includes(userId)) {
+      userIds.push(userId)
+    }
+  }
+  
+  if (userIds.length > 0) {
+    console.log(`📦 Migrating ${userIds.length} existing users to new array format`)
+    await kv.set(["user_ids_array"], userIds)
+    console.log(`✅ Migration complete: ${userIds.length} users`)
+  } else {
+    console.log("ℹ️ No existing users found to migrate")
+  }
 }
 
 // Internal function to add user to the array
@@ -423,6 +483,30 @@ export async function recordNotification(chatId: number, modelName: string, type
   
   // Store with 10-minute expiry
   await kv.set(key, now, { expireIn: 10 * 60 * 1000 })
+}
+
+// Comprehensive migration function for startup
+export async function migrateDatabase(): Promise<void> {
+  console.log("🔄 Starting database migration...")
+  
+  // Migrate users
+  const userResult = await kv.get<number[]>(["user_ids_array"])
+  if (!userResult.value || userResult.value.length === 0) {
+    await migrateUsersToArray()
+  }
+  
+  // Migrate all model subscribers
+  const queue = await getModelQueue()
+  for (const modelName of queue) {
+    const subscriberResult = await kv.get<number[]>(["model_subscribers", modelName])
+    if (!subscriberResult.value || subscriberResult.value.length === 0) {
+      await migrateModelSubscribers(modelName)
+    }
+  }
+  
+  // Verify final counts
+  const finalUserCount = (await getAllUserIds()).length
+  console.log(`✅ Database migration complete. Users: ${finalUserCount}`)
 }
 
 // Export kv for the cron lock in main.ts

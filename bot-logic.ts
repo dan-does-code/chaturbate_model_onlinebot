@@ -254,9 +254,22 @@ export function registerMessageHandlers(bot: Bot) {
 
         case "📊 Stats":
           if (!isAdmin(userId)) return
-          const totalUsers = (await db.getAllUserIds()).length
-          const totalModels = (await db.getModelQueue()).length
-          await ctx.reply(`📊 Bot Statistics\n\n👥 Total Users: ${totalUsers}\n🎭 Tracked Models: ${totalModels}`)
+          try {
+            const totalUsers = (await db.getAllUserIds()).length
+            const totalModels = (await db.getModelQueue()).length
+            const cacheStats = db.getCacheStats()
+            
+            await ctx.reply(
+              `📊 <b>Bot Statistics</b>\n\n` +
+              `👥 Total Users: ${totalUsers}\n` +
+              `🎭 Tracked Models: ${totalModels}\n` +
+              `💾 Cache Size: ${cacheStats.size} items`,
+              { parse_mode: "HTML" }
+            )
+          } catch (error) {
+            console.error("Error getting stats:", error)
+            await ctx.reply("❌ Error retrieving statistics. Please try again.")
+          }
           break
 
         case "🔙 Back to Main":
